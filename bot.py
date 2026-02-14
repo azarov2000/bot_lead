@@ -4,7 +4,6 @@ from datetime import datetime
 from openpyxl import Workbook, load_workbook
 import yadisk
 import tempfile
-import shutil
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -12,11 +11,15 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get("TOKEN")
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Например: https://<railway-app>.up.railway.app/<bot_path>
+PORT = int(os.environ.get("PORT", 8443))
 
 if not TOKEN:
     raise Exception("❌ Telegram TOKEN не задан в переменных окружения")
 if not YANDEX_TOKEN:
     raise Exception("❌ YANDEX_TOKEN не задан в переменных окружения")
+if not WEBHOOK_URL:
+    raise Exception("❌ WEBHOOK_URL не задан в переменных окружения")
 
 SUPERUSERS = {805289423, 502894278}
 DISK_FOLDER = "/SberBot"
@@ -38,20 +41,20 @@ def temp_path(filename):
 
 def cleanup_temp(*files):
     for f in files:
-        if os.path.exists(f):
+        if f and os.path.exists(f):
             os.remove(f)
 
 # ================= ФАЙЛЫ НА ДИСКЕ =================
 def download_file(filename):
-    local_path = temp_path(filename)
+    local_file = temp_path(filename)
     if y.exists(disk_path(filename)):
-        y.download(disk_path(filename), local_path)
-        return local_path
+        y.download(disk_path(filename), local_file)
+        return local_file
     return None
 
 def upload_file(filename):
-    local_path = temp_path(filename)
-    y.upload(local_path, disk_path(filename), overwrite=True)
+    local_file = temp_path(filename)
+    y.upload(local_file, disk_path(filename), overwrite=True)
 
 # ================= ДОСТУП =================
 def load_allowed():
@@ -122,10 +125,7 @@ def get_rows(filename):
         return []
     wb = load_workbook(local_file)
     ws = wb.active
-    rows = [
-        f"{i+1}. {' | '.join(map(str, r[1:5]))}"
-        for i, r in enumerate(ws.iter_rows(min_row=2, values_only=True))
-    ]
+    rows = [f"{i+1}. {' | '.join(map(str, r[1:5]))}" for i, r in enumerate(ws.iter_rows(min_row=2, values_only=True))]
     cleanup_temp(local_file)
     return rows
 
@@ -168,12 +168,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.message.from_user.id
+    filename = get_today_filename()
 
     if not has_access(user_id):
         await update.message.reply_text("❌ Нет доступа.")
         return
 
-    filename = get_today_filename()
     ensure_file(filename)
 
     # --- Админ
@@ -181,14 +181,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "👑 Управление доступом":
             await update.message.reply_text("+ ID — дать доступ\n- ID — забрать доступ")
             return
-
         if text.startswith("+"):
             uid = int(text[1:].strip())
             ALLOWED_USERS.add(uid)
             save_allowed(ALLOWED_USERS)
             await update.message.reply_text(f"Доступ выдан: {uid}")
             return
-
         if text.startswith("-"):
             uid = int(text[1:].strip())
             ALLOWED_USERS.discard(uid)
@@ -211,4 +209,81 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🧹 Очистить файл":
         WAITING_CLEAR_CONFIRM.add(user_id)
-        await update.message.reply_tex_
+        await update.message.reply_text("Напишите ДА для подтверждения.")
+        return
+
+    if user_id in WAITING_CLEAR_CONFIRM:
+        if text.upper() == "ДА":
+            clear_file(filename)
+            await update.message.reply_text("Файл очищен.")
+        else:
+            await update.message.reply_text("Файл не был очищен.")
+        WAITING_CLEAR_CONFIRM.discard(user_id)
+        return
+
+    if text == "❌ Удалить строку":
+        WAITING_DELETE.add(user_id)
+        await update.message.reply_text("Введите номер строки:")
+        return
+
+    if user_id in WAITING_DELETE:
+        try:
+            idx = int(text)
+            delete_row(filename, idx)
+            await update.message.reply_text(f"Удалена строка {idx}.")
+        except:
+            await update.message.reply_text("Введите корректное число.")
+        WAITING_DELETE.discard(user_id)
+        return
+
+    if text == "🗂 Архив Excel":
+        files = list_excel_files()
+        if not files:
+            await update.message.reply_text("Архив пуст.")
+            return
+        msg = "\n".join([f"{i+1}. {f}" for i, f in enumerate(files)])
+        await update.message.reply_text(f"Список файлов:\n{msg}\nВведите номер для скачивания:")
+        WAITING_ARCHIVE_SELECT[user_id] = files
+        return
+
+    if user_id in WAITING_ARCHIVE_SELECT:
+        files = WAITING_ARCHIVE_SELECT[user_id]
+        try:
+            idx = int(text) - 1
+            file_to_send = files[idx]
+            local_file = download_file(file_to_send)
+            await update.message.reply_document(open(local_file, "rb"), reply_markup=main_keyboard(user_id))
+            cleanup_temp(local_file)
+        except:
+            await update.message.reply_text("Некорректный номер файла.")
+        WAITING_ARCHIVE_SELECT.pop(user_id, None)
+        return
+
+    # --- Добавление записи
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) != 4:
+        await update.message.reply_text(f"❌ Нужно 4 строки, получено {len(lines)}.")
+        return
+
+    username = update.message.from_user.username or update.message.from_user.full_name
+    count = append_row(
+        filename,
+        [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), *lines, username]
+    )
+    await update.message.reply_text(f"Добавлено. Всего строк: {count}")
+
+# ================= ЗАПУСК =================
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    print("Bot running on webhook...")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL
+    )
+
+if __name__ == "__main__":
+    main()
