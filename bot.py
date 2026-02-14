@@ -11,8 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get("TOKEN")
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Например: https://<railway-app>.up.railway.app/<bot_path>
-PORT = int(os.environ.get("PORT", 8443))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # например https://my-sberbot.up.railway.app/bot
 
 if not TOKEN:
     raise Exception("❌ Telegram TOKEN не задан в переменных окружения")
@@ -60,9 +59,11 @@ def upload_file(filename):
 def load_allowed():
     local_file = download_file(ALLOWED_FILE)
     if not local_file:
-        with open(temp_path(ALLOWED_FILE), "w", encoding="utf-8") as f:
+        temp_file = temp_path(ALLOWED_FILE)
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(list(SUPERUSERS), f)
         upload_file(ALLOWED_FILE)
+        cleanup_temp(temp_file)
         return set(SUPERUSERS)
     with open(local_file, "r", encoding="utf-8") as f:
         users = set(json.load(f))
@@ -70,12 +71,13 @@ def load_allowed():
     return users.union(SUPERUSERS)
 
 def save_allowed(users):
-    with open(temp_path(ALLOWED_FILE), "w", encoding="utf-8") as f:
+    temp_file = temp_path(ALLOWED_FILE)
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(list(users), f)
     upload_file(ALLOWED_FILE)
+    cleanup_temp(temp_file)
 
 ALLOWED_USERS = load_allowed()
-
 def has_access(user_id):
     return user_id in SUPERUSERS or user_id in ALLOWED_USERS
 
@@ -104,6 +106,7 @@ def ensure_file(filename):
         ws.append(["Дата", "ВСП", "ИНН", "Наименование", "Бумага/эл", "User"])
         wb.save(temp_path(filename))
         upload_file(filename)
+        cleanup_temp(temp_path(filename))
 
 def append_row(filename, row):
     local_file = download_file(filename)
@@ -125,7 +128,10 @@ def get_rows(filename):
         return []
     wb = load_workbook(local_file)
     ws = wb.active
-    rows = [f"{i+1}. {' | '.join(map(str, r[1:5]))}" for i, r in enumerate(ws.iter_rows(min_row=2, values_only=True))]
+    rows = [
+        f"{i+1}. {' | '.join(map(str, r[1:5]))}"
+        for i, r in enumerate(ws.iter_rows(min_row=2, values_only=True))
+    ]
     cleanup_temp(local_file)
     return rows
 
@@ -144,6 +150,7 @@ def clear_file(filename):
     ws.append(["Дата", "ВСП", "ИНН", "Наименование", "Бумага/эл", "User"])
     wb.save(temp_path(filename))
     upload_file(filename)
+    cleanup_temp(temp_path(filename))
 
 def list_excel_files():
     items = y.listdir(DISK_FOLDER)
@@ -168,15 +175,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.message.from_user.id
-    filename = get_today_filename()
 
     if not has_access(user_id):
         await update.message.reply_text("❌ Нет доступа.")
         return
 
+    filename = get_today_filename()
     ensure_file(filename)
 
-    # --- Админ
+    # --- Админ ---
     if user_id in SUPERUSERS:
         if text == "👑 Управление доступом":
             await update.message.reply_text("+ ID — дать доступ\n- ID — забрать доступ")
@@ -194,7 +201,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Доступ забран: {uid}")
             return
 
-    # --- Кнопки
+    # --- Кнопки ---
     if text == "📖 Показать записи":
         rows = get_rows(filename)
         msg = "\n".join(rows) if rows else "Нет записей."
@@ -203,21 +210,21 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📥 Скачать Excel":
         local_file = download_file(filename)
-        await update.message.reply_document(open(local_file, "rb"), reply_markup=main_keyboard(user_id))
-        cleanup_temp(local_file)
+        if local_file:
+            await update.message.reply_document(open(local_file, "rb"), reply_markup=main_keyboard(user_id))
+            cleanup_temp(local_file)
         return
 
     if text == "🧹 Очистить файл":
         WAITING_CLEAR_CONFIRM.add(user_id)
         await update.message.reply_text("Напишите ДА для подтверждения.")
         return
-
     if user_id in WAITING_CLEAR_CONFIRM:
         if text.upper() == "ДА":
             clear_file(filename)
-            await update.message.reply_text("Файл очищен.")
+            await update.message.reply_text("Файл очищен.", reply_markup=main_keyboard(user_id))
         else:
-            await update.message.reply_text("Файл не был очищен.")
+            await update.message.reply_text("Файл не был очищен.", reply_markup=main_keyboard(user_id))
         WAITING_CLEAR_CONFIRM.discard(user_id)
         return
 
@@ -225,52 +232,49 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WAITING_DELETE.add(user_id)
         await update.message.reply_text("Введите номер строки:")
         return
-
     if user_id in WAITING_DELETE:
         try:
             idx = int(text)
             delete_row(filename, idx)
-            await update.message.reply_text(f"Удалена строка {idx}.")
+            await update.message.reply_text(f"Удалена строка {idx}.", reply_markup=main_keyboard(user_id))
         except:
-            await update.message.reply_text("Введите корректное число.")
+            await update.message.reply_text("Введите корректное число.", reply_markup=main_keyboard(user_id))
         WAITING_DELETE.discard(user_id)
         return
 
     if text == "🗂 Архив Excel":
         files = list_excel_files()
         if not files:
-            await update.message.reply_text("Архив пуст.")
+            await update.message.reply_text("Архив пуст.", reply_markup=main_keyboard(user_id))
             return
-        msg = "\n".join([f"{i+1}. {f}" for i, f in enumerate(files)])
-        await update.message.reply_text(f"Список файлов:\n{msg}\nВведите номер для скачивания:")
         WAITING_ARCHIVE_SELECT[user_id] = files
+        msg = "\n".join([f"{i+1}. {f}" for i, f in enumerate(files)])
+        await update.message.reply_text(f"Выберите файл для скачивания по номеру:\n{msg}")
         return
-
     if user_id in WAITING_ARCHIVE_SELECT:
-        files = WAITING_ARCHIVE_SELECT[user_id]
         try:
             idx = int(text) - 1
-            file_to_send = files[idx]
-            local_file = download_file(file_to_send)
-            await update.message.reply_document(open(local_file, "rb"), reply_markup=main_keyboard(user_id))
-            cleanup_temp(local_file)
+            files = WAITING_ARCHIVE_SELECT[user_id]
+            if 0 <= idx < len(files):
+                local_file = download_file(files[idx])
+                await update.message.reply_document(open(local_file, "rb"), reply_markup=main_keyboard(user_id))
+                cleanup_temp(local_file)
+            else:
+                await update.message.reply_text("Некорректный номер.", reply_markup=main_keyboard(user_id))
         except:
-            await update.message.reply_text("Некорректный номер файла.")
-        WAITING_ARCHIVE_SELECT.pop(user_id, None)
+            await update.message.reply_text("Введите число.", reply_markup=main_keyboard(user_id))
+        WAITING_ARCHIVE_SELECT.pop(user_id)
         return
 
-    # --- Добавление записи
+    # --- Добавление записи ---
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if len(lines) != 4:
-        await update.message.reply_text(f"❌ Нужно 4 строки, получено {len(lines)}.")
+        await update.message.reply_text(f"❌ Нужно 4 строки, получено {len(lines)}.", reply_markup=main_keyboard(user_id))
         return
 
     username = update.message.from_user.username or update.message.from_user.full_name
-    count = append_row(
-        filename,
-        [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), *lines, username]
-    )
-    await update.message.reply_text(f"Добавлено. Всего строк: {count}")
+    count = append_row(filename, [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), *lines, username])
+    await update.message.reply_text(f"Добавлено. Всего строк: {count}", reply_markup=main_keyboard(user_id))
 
 # ================= ЗАПУСК =================
 def main():
@@ -278,10 +282,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-    print("Bot running on webhook...")
     app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
+        port=int(os.environ.get("PORT", 3000)),
         webhook_url=WEBHOOK_URL
     )
 
