@@ -4,6 +4,7 @@ from datetime import datetime
 from openpyxl import Workbook, load_workbook
 import yadisk
 import tempfile
+import asyncio
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -11,7 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get("TOKEN")
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # например https://my-sberbot.up.railway.app/bot
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://<название-приложения>.up.railway.app/bot
 
 if not TOKEN:
     raise Exception("❌ Telegram TOKEN не задан в переменных окружения")
@@ -78,6 +79,7 @@ def save_allowed(users):
     cleanup_temp(temp_file)
 
 ALLOWED_USERS = load_allowed()
+
 def has_access(user_id):
     return user_id in SUPERUSERS or user_id in ALLOWED_USERS
 
@@ -154,8 +156,7 @@ def clear_file(filename):
 
 def list_excel_files():
     items = y.listdir(DISK_FOLDER)
-    files = [i["name"] for i in items if i["type"] == "file" and i["name"].endswith(".xlsx")]
-    return files
+    return [i["name"] for i in items if i["type"] == "file" and i["name"].endswith(".xlsx")]
 
 # ================= СОСТОЯНИЯ =================
 WAITING_DELETE = set()
@@ -277,11 +278,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Добавлено. Всего строк: {count}", reply_markup=main_keyboard(user_id))
 
 # ================= ЗАПУСК =================
-def main():
+async def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
+    # Запуск webhook на Railway
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 3000)),
@@ -289,4 +291,4 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
